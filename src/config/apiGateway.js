@@ -12,6 +12,10 @@
  */
 
 import axios from 'axios';
+import { createLogger } from '../middleware/logger.js';
+import { attachServiceAuth } from '../utils/serviceAuth.js';
+
+const logger = createLogger('APIGateway');
 
 // ============================================================================
 // Service URLs from Environment Variables
@@ -68,11 +72,11 @@ export const createServiceClient = (baseURL, options = {}) => {
   // Request interceptor for logging
   client.interceptors.request.use(
     (config) => {
-      console.log(`[API Gateway] → ${config.method?.toUpperCase()} ${config.baseURL}${config.url}`);
+      logger.debug(`Sending request`, { method: config.method?.toUpperCase(), url: `${config.baseURL}${config.url}` });
       return config;
     },
     (error) => {
-      console.error('[API Gateway] Request error:', error.message);
+      logger.error('Request preparation error', error);
       return Promise.reject(error);
     }
   );
@@ -80,12 +84,12 @@ export const createServiceClient = (baseURL, options = {}) => {
   // Response interceptor for logging
   client.interceptors.response.use(
     (response) => {
-      console.log(`[API Gateway] ✓ ${response.config.method?.toUpperCase()} ${response.config.url} - ${response.status}`);
+      logger.debug(`Response received`, { method: response.config.method?.toUpperCase(), url: response.config.url, status: response.status });
       return response;
     },
     (error) => {
       const status = error.response?.status || 'N/A';
-      console.error(`[API Gateway] ✗ ${error.config?.method?.toUpperCase()} ${error.config?.url} - ${status}`);
+      logger.error('Response error', error, { method: error.config?.method?.toUpperCase(), url: error.config?.url, status });
       return Promise.reject(error);
     }
   );
@@ -97,8 +101,8 @@ export const createServiceClient = (baseURL, options = {}) => {
 // Pre-configured Service Clients
 // ============================================================================
 
-export const authServiceClient = createServiceClient(SERVICES.AUTH);
-export const chatServiceClient = createServiceClient(SERVICES.CHAT);
+export const authServiceClient = attachServiceAuth(createServiceClient(SERVICES.AUTH));
+export const chatServiceClient = attachServiceAuth(createServiceClient(SERVICES.CHAT));
 export const socketServiceClient = createServiceClient(SERVICES.SOCKET);
 
 // ============================================================================

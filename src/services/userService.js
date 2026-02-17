@@ -9,15 +9,22 @@
  * This ensures:
  * • Separation of concerns (auth-service owns user data)
  * • Stateless socket-gateway (no database coupling)
- * • Resilience via retry logic
+ * • Resilience via retry logic and circuit breaker
  * • Non-blocking operations (failures don't crash socket connections)
  */
 
 import { authServiceClient } from '../config/apiGateway.js';
-import { retryAxiosRequest } from '../utils/retry.js';
+import { retryAxiosRequest, createCircuitBreaker } from '../utils/retry.js';
 import { serviceLogger } from '../middleware/logger.js';
 
 const logger = serviceLogger('UserService');
+
+// Create circuit breaker for auth service
+const authServiceBreaker = createCircuitBreaker('AuthService', {
+  failureThreshold: 5,
+  resetTimeout: 30000,
+  monitorInterval: 10000,
+});
 
 /**
  * Updates user online/offline status via auth-service HTTP API
@@ -29,15 +36,24 @@ export const updateUserStatus = async (userId, status) => {
   try {
     logger.info('Updating user status via auth-service', { userId, status });
     
-    await retryAxiosRequest(
-      () => authServiceClient.patch(`/api/users/${userId}/status`, { 
-        status,
-        lastSeen: new Date()
-      }),
-      { 
-        maxRetries: 2, 
-        baseDelay: 500,
-        maxDelay: 2000
+    await authServiceBreaker.execute(
+      async () => {
+        return await retryAxiosRequest(
+          () => authServiceClient.patch(`/api/users/${userId}/status`, { 
+            status,
+            lastSeen: new Date()
+          }),
+          { 
+            maxRetries: 2, 
+            baseDelay: 500,
+            maxDelay: 2000
+          }
+        );
+      },
+      // Fallback function if circuit is open
+      () => {
+        logger.warn('Auth service unavailable, skipping status update', { userId, status });
+        return null;
       }
     );
     
@@ -62,12 +78,21 @@ export const getUserById = async (userId) => {
   try {
     logger.info('Fetching user via auth-service', { userId });
     
-    const response = await retryAxiosRequest(
-      () => authServiceClient.get(`/api/users/${userId}`),
-      { maxRetries: 2, baseDelay: 500 }
+    const response = await authServiceBreaker.execute(
+      async () => {
+        return await retryAxiosRequest(
+          () => authServiceClient.get(`/api/users/${userId}`),
+          { maxRetries: 2, baseDelay: 500 }
+        );
+      },
+      // Fallback function if circuit is open
+      () => {
+        logger.warn('Auth service unavailable, skipping user fetch', { userId });
+        return null;
+      }
     );
     
-    return response.data;
+    return response?.data || null;
   } catch (error) {
     logger.error('Failed to fetch user', { userId, error: error.message });
     return null;

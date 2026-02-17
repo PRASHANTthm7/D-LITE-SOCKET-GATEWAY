@@ -5,10 +5,12 @@
  * - Provides consistent logging format across all services
  * - Includes request tracking with unique IDs for debugging
  * - Supports different log levels (info, warn, error)
+ * - Integrates with persistent file-based logging for production audit trails
  * - Can be easily extended to integrate with external logging services (e.g., Winston, Datadog)
  */
 
 import { v4 as uuidv4 } from 'uuid';
+import { createPersistentLogger } from '../utils/persistentLogger.js';
 
 /**
  * Log levels
@@ -26,6 +28,8 @@ export const LogLevel = {
 class Logger {
   constructor(context = 'App') {
     this.context = context;
+    // Create persistent logger for this context
+    this.persistentLogger = createPersistentLogger(context);
   }
 
   /**
@@ -50,6 +54,8 @@ class Logger {
   info(message, data = null) {
     const logEntry = this.formatMessage(LogLevel.INFO, message, data);
     console.log(`[${logEntry.level}] [${logEntry.context}]`, message, data || '');
+    // Also write to persistent storage
+    this.persistentLogger.info(message, data);
   }
 
   /**
@@ -58,6 +64,8 @@ class Logger {
   warn(message, data = null) {
     const logEntry = this.formatMessage(LogLevel.WARN, message, data);
     console.warn(`[${logEntry.level}] [${logEntry.context}]`, message, data || '');
+    // Also write to persistent storage
+    this.persistentLogger.warn(message, data);
   }
 
   /**
@@ -73,6 +81,8 @@ class Logger {
       error: error?.message,
       ...data,
     });
+    // Also write to persistent storage
+    this.persistentLogger.error(message, error, data);
   }
 
   /**
@@ -82,6 +92,8 @@ class Logger {
     if (process.env.NODE_ENV === 'development') {
       const logEntry = this.formatMessage(LogLevel.DEBUG, message, data);
       console.debug(`[${logEntry.level}] [${logEntry.context}]`, message, data || '');
+      // Also write to persistent storage
+      this.persistentLogger.debug(message, data);
     }
   }
 }

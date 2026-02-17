@@ -22,8 +22,12 @@
  * Use Redis for shared presence state instead of in-memory Map.
  */
 
+import { createLogger } from '../middleware/logger.js';
+
+const logger = createLogger('Database');
+
 export const connectDB = async () => {
-  console.log('[Socket Gateway] ✓ No database connection - using in-memory presence tracking');
-  console.log('[Socket Gateway] → User persistence delegated to auth-service');
-  console.log('[Socket Gateway] → Message persistence delegated to chat-service');
+  logger.info('No database connection - using in-memory presence tracking');
+  logger.info('User persistence delegated to auth-service');
+  logger.info('Message persistence delegated to chat-service');
 };

@@ -3,16 +3,33 @@ import { saveMessage } from '../services/messageService.js';
 import { sendPresenceEvent } from '../services/presenceClient.js';
 import { sendQuantumRoomEvent } from '../services/quantumRoomClient.js';
 import { analyzeMessage } from '../services/aiEngineClient.js';
+import { createLogger } from '../middleware/logger.js';
+import { validateMessage, validateTypingData, validateMessageStatusData } from '../utils/validation.js';
+import { rateLimiters } from '../utils/rateLimiter.js';
+
+const logger = createLogger('Messages');
 
 export const registerMessageHandlers = (io, socket) => {
   // ─── Send message (private or group) ───────────────────────────────────
   socket.on('send_message', async (data) => {
+    // Check rate limit
+    if (!rateLimiters.send_message(socket)) return;
+
     try {
       const { sender_id, receiver_id, group_id, content, message_type = 'text', expires_at } = data;
 
       // Validate message data
-      if (!sender_id || !content) {
-        socket.emit('error', { message: 'Invalid message data: sender_id and content required' });
+      try {
+        validateMessage({ sender_id, receiver_id, group_id, content, message_type, expires_at });
+      } catch (validationError) {
+        socket.emit('error', { message: validationError.message });
+        return;
+      }
+
+      // Verify sender matches authenticated user
+      if (socket.userId !== sender_id) {
+        logger.warn('Sender mismatch', { socket_user: socket.userId, claimed_sender: sender_id });
+        socket.emit('error', { message: 'Sender ID must match authenticated user' });
         return;
       }
 
@@ -54,7 +71,7 @@ export const registerMessageHandlers = (io, socket) => {
 
       // Analyze message with AI Engine (non-blocking)
       analyzeMessage(sender_id, content).catch(err => {
-        console.log('[AI] Message analysis failed:', err.message);
+        logger.debug('Message analysis failed', { sender_id, error: err.message });
       });
 
       // Send presence event for message sent
@@ -66,7 +83,7 @@ export const registerMessageHandlers = (io, socket) => {
         // ── Group message: broadcast to all members in the room ────────
         const roomId = `group_${group_id}`;
         io.to(roomId).emit('receive_message', savedMessage);
-        console.log(`[Group] Message sent to group ${group_id} by ${sender_id}`);
+        logger.info(`Group message sent`, { group_id, sender_id });
 
         // Send quantum room event
         sendQuantumRoomEvent(group_id, sender_id, 'message_sent', {
@@ -84,7 +101,7 @@ export const registerMessageHandlers = (io, socket) => {
                 group_id: group_id,
                 reason: 'expired'
               });
-              console.log(`[LiveThought] Auto-deleted expired group message ${savedMessage._id}`);
+              logger.debug(`Auto-deleted expired group message`, { message_id: savedMessage._id || savedMessage.id, group_id });
             }, expiryTime);
           }
         }
@@ -93,9 +110,9 @@ export const registerMessageHandlers = (io, socket) => {
         const receiverSocketId = onlineUsers.get(receiver_id);
         if (receiverSocketId) {
           io.to(receiverSocketId).emit('receive_message', savedMessage);
-          console.log(`[Private] Message sent from ${sender_id} to ${receiver_id}`);
+          logger.info(`Private message sent`, { sender_id, receiver_id });
         } else {
-          console.log(`[Private] Receiver ${receiver_id} is offline, message saved to database`);
+          logger.info(`Receiver offline, message saved to database`, { sender_id, receiver_id });
         }
 
         // Schedule auto-deletion if expires_at is set
@@ -116,7 +133,7 @@ export const registerMessageHandlers = (io, socket) => {
                   reason: 'expired'
                 });
               }
-              console.log(`[LiveThought] Auto-deleted expired private message ${savedMessage._id}`);
+              logger.debug(`Auto-deleted expired private message`, { message_id: savedMessage._id || savedMessage.id, receiver_id });
             }, expiryTime);
           }
         }
@@ -129,7 +146,7 @@ export const registerMessageHandlers = (io, socket) => {
       });
 
     } catch (error) {
-      console.error('[Message] Error handling send_message:', error);
+      logger.error('Error handling send_message', error, { sender_id });
       socket.emit('error', {
         message: 'Failed to send message',
         error: error.message
@@ -139,12 +156,24 @@ export const registerMessageHandlers = (io, socket) => {
 
   // ─── Send group message (dedicated event) ─────────────────────────────
   socket.on('send_group_message', async (data) => {
+    // Check rate limit
+    if (!rateLimiters.send_group_message(socket)) return;
+
     try {
       const { sender_id, group_id, content, message_type = 'text', expires_at } = data;
 
       // Validate message data
-      if (!sender_id || !group_id || !content) {
-        socket.emit('error', { message: 'Invalid group message data: sender_id, group_id, and content required' });
+      try {
+        validateMessage({ sender_id, group_id, content, message_type, expires_at });
+      } catch (validationError) {
+        socket.emit('error', { message: validationError.message });
+        return;
+      }
+      
+      // Verify sender matches authenticated user
+      if (socket.userId !== sender_id) {
+        logger.warn('Sender mismatch in group message', { socket_user: socket.userId, claimed_sender: sender_id });
+        socket.emit('error', { message: 'Sender ID must match authenticated user' });
         return;
       }
 
@@ -170,13 +199,13 @@ export const registerMessageHandlers = (io, socket) => {
 
       // Analyze message with AI Engine (non-blocking)
       analyzeMessage(sender_id, content).catch(err => {
-        console.log('[AI] Message analysis failed:', err.message);
+        logger.debug('Message analysis failed', { sender_id, error: err.message });
       });
 
       // Broadcast to all members in the group room
       const roomId = `group_${group_id}`;
       io.to(roomId).emit('receive_message', savedMessage);
-      console.log(`[Group] Message sent to group ${group_id} by ${sender_id}`);
+      logger.info(`Group message sent`, { group_id, sender_id });
 
       // Schedule auto-deletion if expires_at is set
       if (savedMessage.expires_at) {
@@ -188,7 +217,7 @@ export const registerMessageHandlers = (io, socket) => {
               group_id: group_id,
               reason: 'expired'
             });
-            console.log(`[LiveThought] Auto-deleted expired message ${savedMessage._id} from group ${group_id}`);
+            logger.debug(`Auto-deleted expired message from group`, { message_id: savedMessage._id, group_id });
           }, expiryTime);
         }
       }
@@ -200,7 +229,7 @@ export const registerMessageHandlers = (io, socket) => {
       });
 
     } catch (error) {
-      console.error('[Group] Error handling send_group_message:', error);
+      logger.error('Error handling send_group_message', error, { sender_id, group_id });
       socket.emit('error', {
         message: 'Failed to send group message',
         error: error.message
@@ -211,6 +240,9 @@ export const registerMessageHandlers = (io, socket) => {
 
   // ─── Mark message as read ──────────────────────────────────────────────
   socket.on('message_read', async (data) => {
+    // Check rate limit
+    if (!rateLimiters.message_read(socket)) return;
+
     try {
       const { message_id, sender_id } = data;
 
@@ -226,12 +258,13 @@ export const registerMessageHandlers = (io, socket) => {
         });
       }
     } catch (error) {
-      console.error('Error handling message_read:', error);
+      logger.error('Error handling message_read', error, { message_id, sender_id });
     }
   });
 
   // ─── Delete message ────────────────────────────────────────────────────
-  socket.on('delete_message', async (data) => {
+  socket.on('delete_message', async (data) => {    // Check rate limit
+    if (!rateLimiters.delete_message(socket)) return;
     try {
       const { message_id, receiver_id } = data;
 
@@ -248,7 +281,7 @@ export const registerMessageHandlers = (io, socket) => {
         message_id
       });
     } catch (error) {
-      console.error('Error handling delete_message:', error);
+      logger.error('Error handling delete_message', error, { message_id, receiver_id });
     }
   });
 
@@ -265,8 +298,19 @@ export const registerMessageHandlers = (io, socket) => {
    * - Includes sender info so UI can display "User X is typing..."
    */
   socket.on('typing', (data) => {
+    // Check rate limit
+    if (!rateLimiters.typing(socket)) return;
+
     try {
       const { receiver_id, group_id } = data;
+
+      // Validate typing data
+      try {
+        validateTypingData({ receiver_id, group_id });
+      } catch (validationError) {
+        socket.emit('error', { message: validationError.message });
+        return;
+      }
 
       if (group_id) {
         // Group typing indicator
@@ -290,7 +334,7 @@ export const registerMessageHandlers = (io, socket) => {
         }
       }
     } catch (error) {
-      console.error('[Typing] Error handling typing event:', error);
+      logger.error('Error handling typing event', error, { user_id: socket.userId });
     }
   });
 
@@ -298,6 +342,9 @@ export const registerMessageHandlers = (io, socket) => {
    * Handle stop typing indicator
    */
   socket.on('stop_typing', (data) => {
+    // Check rate limit
+    if (!rateLimiters.stop_typing(socket)) return;
+
     try {
       const { receiver_id, group_id } = data;
 
@@ -318,7 +365,7 @@ export const registerMessageHandlers = (io, socket) => {
         }
       }
     } catch (error) {
-      console.error('[Typing] Error handling stop_typing event:', error);
+      logger.error('Error handling stop_typing event', error, { user_id: socket.userId });
     }
   });
 
@@ -335,8 +382,19 @@ export const registerMessageHandlers = (io, socket) => {
    * - Status updates can be batched for efficiency in high-volume chats
    */
   socket.on('message_delivered', (data) => {
+    // Check rate limit
+    if (!rateLimiters.message_delivered(socket)) return;
+
     try {
       const { message_id, sender_id } = data;
+
+      // Validate message status data
+      try {
+        validateMessageStatusData({ message_id, sender_id });
+      } catch (validationError) {
+        socket.emit('error', { message: validationError.message });
+        return;
+      }
 
       // Notify sender that message was delivered
       const senderSocketId = onlineUsers.get(sender_id);
@@ -348,7 +406,7 @@ export const registerMessageHandlers = (io, socket) => {
         });
       }
     } catch (error) {
-      console.error('[Status] Error handling message_delivered:', error);
+      logger.error('Error handling message_delivered', error, { message_id, sender_id });
     }
   });
 
@@ -361,8 +419,19 @@ export const registerMessageHandlers = (io, socket) => {
    * - Respects user privacy settings (if implemented)
    */
   socket.on('message_read_status', (data) => {
+    // Check rate limit
+    if (!rateLimiters.message_read_status(socket)) return;
+
     try {
       const { message_id, sender_id } = data;
+
+      // Validate message status data
+      try {
+        validateMessageStatusData({ message_id, sender_id });
+      } catch (validationError) {
+        socket.emit('error', { message: validationError.message });
+        return;
+      }
 
       // Notify sender that message was read
       const senderSocketId = onlineUsers.get(sender_id);
@@ -374,7 +443,7 @@ export const registerMessageHandlers = (io, socket) => {
         });
       }
     } catch (error) {
-      console.error('[Status] Error handling message_read_status:', error);
+      logger.error('Error handling message_read_status', error, { message_id, sender_id });
     }
   });
 };

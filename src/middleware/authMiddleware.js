@@ -1,17 +1,16 @@
 import axios from 'axios';
+import { createLogger } from './logger.js';
+import { TIMEOUTS } from '../config/timeouts.js';
 
+const logger = createLogger('Auth');
 const AUTH_SERVICE_URL = process.env.AUTH_SERVICE_URL || 'http://localhost:3001/api';
 
-/**
- * Verify token with Auth Service
- * Delegates JWT verification to centralized Auth Service
- */
 async function verifyTokenWithAuthService(token) {
   try {
     const response = await axios.post(
       `${AUTH_SERVICE_URL}/auth/verify-token`,
       { token },
-      { timeout: 3000 }
+      { timeout: TIMEOUTS.AUTH_SERVICE_TIMEOUT }
     );
 
     if (response.data.success && response.data.data) {
@@ -20,7 +19,7 @@ async function verifyTokenWithAuthService(token) {
     
     throw new Error('Invalid token response from Auth Service');
   } catch (error) {
-    console.error('[Auth Service] Token verification failed:', error.message);
+    logger.error('Token verification failed', error, { token: token?.substring(0, 20) });
     throw new Error('Token verification failed');
   }
 }
@@ -40,10 +39,10 @@ export const authenticateSocket = async (socket, next) => {
     socket.userId = user.userId;
     socket.user = user;
     
-    console.log(`[Socket Auth] User authenticated: ${user.username} (${user.userId})`);
+    logger.info(`User authenticated`, { username: user.username, userId: user.userId });
     next();
   } catch (error) {
-    console.error('[Socket Auth] Authentication failed:', error.message);
+    logger.error('Authentication failed', error);
     next(new Error('Authentication error: ' + error.message));
   }
 };

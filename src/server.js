@@ -42,6 +42,8 @@ import { errorHandler, notFoundHandler } from './middleware/errorHandler.js';
 import { registerMessageHandlers } from './handlers/messageHandlers.js';
 import { registerConnectionHandlers } from './handlers/connectionHandlers.js';
 import { sendPresenceEvent } from './services/presenceClient.js';
+import { startPeriodicCleanup } from './utils/typingTimers.js';
+import { getRecentLogs, clearOldLogs } from './utils/persistentLogger.js';
 
 dotenv.config();
 
@@ -54,6 +56,11 @@ for (const envVar of requiredEnvVars) {
   }
 }
 
+// Parse CORS origins - must be explicitly configured, no default in production
+const CORS_ORIGINS = process.env.CORS_ORIGINS
+  ? process.env.CORS_ORIGINS.split(',')
+  : [];
+
 const app = express();
 const httpServer = createServer(app);
 
@@ -62,7 +69,7 @@ const httpServer = createServer(app);
 // ============================================================================
 
 app.use(cors({
-  origin: process.env.CORS_ORIGINS?.split(',') || ['http://localhost:5173'],
+  origin: CORS_ORIGINS,
   credentials: true
 }));
 app.use(express.json());
@@ -75,13 +82,15 @@ connectDB(); // Logs that we're using in-memory presence only
 // Socket.IO Configuration
 // ============================================================================
 
+const SOCKET_TRANSPORTS = (process.env.SOCKET_TRANSPORTS || 'websocket,polling').split(',');
+
 const io = new Server(httpServer, {
   cors: {
-    origin: process.env.CORS_ORIGINS?.split(',') || ['http://localhost:5173'],
+    origin: CORS_ORIGINS,
     credentials: true,
     methods: ['GET', 'POST']
   },
-  transports: ['websocket', 'polling']
+  transports: SOCKET_TRANSPORTS
 });
 
 /**
@@ -184,6 +193,21 @@ app.get('/metrics', (req, res) => {
   });
 });
 
+/**
+ * Recent logs endpoint (for debugging, should be restricted in production)
+ * Returns the most recent log entries
+ */
+app.get('/logs', (req, res) => {
+  const lines = parseInt(req.query.lines || '100', 10);
+  const recentLogs = getRecentLogs(Math.min(lines, 1000)); // Max 1000 lines
+  
+  res.json({
+    count: recentLogs.length,
+    logs: recentLogs,
+    timestamp: new Date().toISOString(),
+  });
+});
+
 // ============================================================================
 // Error Handling Middleware (must be last)
 // ============================================================================
@@ -192,24 +216,131 @@ app.use(notFoundHandler); // Handle 404s
 app.use(errorHandler); // Handle all errors
 
 // ============================================================================
+// Stale Connection Cleanup
+// ============================================================================
+
+/**
+ * Periodically remove stale entries from onlineUsers Map.
+ * Prevents memory leaks if disconnect handlers fail to execute.
+ */
+const STALE_CONNECTION_CLEANUP_INTERVAL = parseInt(process.env.STALE_CONNECTION_CLEANUP_INTERVAL || '60000', 10);
+
+const startStaleConnectionCleanup = () => {
+  setInterval(() => {
+    const activeSocketIds = new Set();
+    io.sockets.sockets.forEach(socket => {
+      activeSocketIds.add(socket.id);
+    });
+
+    let staleCount = 0;
+    for (const [userId, socketId] of onlineUsers.entries()) {
+      if (!activeSocketIds.has(socketId)) {
+        onlineUsers.delete(userId);
+        staleCount++;
+        socketGatewayLogger.warn('Removed stale connection', { userId, socketId });
+      }
+    }
+
+    if (staleCount > 0) {
+      socketGatewayLogger.info('Stale connection cleanup completed', {
+        removed: staleCount,
+        remaining: onlineUsers.size,
+      });
+    }
+  }, STALE_CONNECTION_CLEANUP_INTERVAL);
+};
+
+// ============================================================================
 // Server Startup
 // ============================================================================
 
-const PORT = process.env.PORT || 3002;
+const PORT = parseInt(process.env.PORT || '3002', 10);
+const LOG_CLEANUP_INTERVAL = parseInt(process.env.LOG_CLEANUP_INTERVAL || '86400000', 10);
+const OLD_LOG_RETENTION_DAYS = parseInt(process.env.OLD_LOG_RETENTION_DAYS || '7', 10);
+
 httpServer.listen(PORT, () => {
   socketGatewayLogger.info('Socket Gateway started', {
     port: PORT,
     environment: process.env.NODE_ENV || 'development',
+    persistentLogging: true,
+    logLevel: process.env.LOG_LEVEL || 'info',
+    logDir: process.env.LOG_DIR || './logs',
   });
+  
+  // Start stale connection cleanup
+  startStaleConnectionCleanup();
+  
+  // Start periodic cleanup of stale typing timers
+  startPeriodicCleanup();
+  
+  // Schedule old log cleanup with configurable interval and retention
+  setInterval(() => {
+    clearOldLogs(OLD_LOG_RETENTION_DAYS);
+  }, LOG_CLEANUP_INTERVAL);
 });
 
-// Graceful shutdown
+// ============================================================================
+// Graceful Shutdown
+// ============================================================================
+
 process.on('SIGTERM', () => {
-  socketGatewayLogger.info('SIGTERM received, shutting down gracefully');
+  socketGatewayLogger.info('SIGTERM received, initiating graceful shutdown');
+  
+  // Disconnect all socket clients gracefully
+  io.disconnectSockets();
+  socketGatewayLogger.info('Socket.IO connections closed');
+  
+  // Close HTTP server
   httpServer.close(() => {
-    socketGatewayLogger.info('Server closed');
+    socketGatewayLogger.info('HTTP server closed');
+    onlineUsers.clear();
+    socketGatewayLogger.info('Shutdown complete');
     process.exit(0);
   });
+  
+  // Force exit after 10 seconds if graceful shutdown is taking too long
+  setTimeout(() => {
+    socketGatewayLogger.error('Graceful shutdown timeout, forcing exit');
+    process.exit(1);
+  }, 10000);
+});
+
+process.on('SIGINT', () => {
+  socketGatewayLogger.info('SIGINT received, initiating graceful shutdown');
+  process.emit('SIGTERM');
+});
+
+// ============================================================================
+// Process-Level Error Handlers
+// ============================================================================
+
+/**
+ * Handle uncaught exceptions
+ * These are errors thrown outside of any try-catch block
+ */
+process.on('uncaughtException', (error) => {
+  socketGatewayLogger.error('UNCAUGHT EXCEPTION', error, {
+    type: 'uncaughtException',
+    fatal: true,
+  });
+  
+  // Exit process to prevent zombie state
+  process.exit(1);
+});
+
+/**
+ * Handle unhandled promise rejections
+ * These are promises rejected without a .catch() handler
+ */
+process.on('unhandledRejection', (reason, promise) => {
+  socketGatewayLogger.error('UNHANDLED PROMISE REJECTION', reason, {
+    type: 'unhandledRejection',
+    promise: promise.toString(),
+    fatal: true,
+  });
+  
+  // Exit process to prevent zombie state
+  process.exit(1);
 });
 
 export { io };

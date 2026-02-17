@@ -2,6 +2,12 @@ import { onlineUsers } from '../server.js';
 import { updateUserStatus } from '../services/userService.js';
 import { sendPresenceEvent } from '../services/presenceClient.js';
 import { sendQuantumRoomEvent } from '../services/quantumRoomClient.js';
+import { createLogger } from '../middleware/logger.js';
+import { validateRoomData, validateGroupData, validateTypingData } from '../utils/validation.js';
+import { rateLimiters } from '../utils/rateLimiter.js';
+import { setTypingTimer, clearTypingTimer, clearUserTypingTimers } from '../utils/typingTimers.js';
+
+const logger = createLogger('Connection');
 
 /**
  * ┌─────────────────────────────────────────────────────────────────────────┐
@@ -39,7 +45,7 @@ import { sendQuantumRoomEvent } from '../services/quantumRoomClient.js';
 const broadcastOnlineUsers = (io) => {
   const onlineUsersList = Array.from(onlineUsers.keys());
   io.emit('online_users', onlineUsersList);
-  console.log(`[Presence] Broadcasting online users: ${onlineUsersList.length} users online`);
+  logger.info(`Broadcasting online users`, { count: onlineUsersList.length });
 };
 
 export const registerConnectionHandlers = (io, socket) => {
@@ -50,7 +56,9 @@ export const registerConnectionHandlers = (io, socket) => {
   onlineUsers.set(userId, socket.id);
 
   // Update user status in database
-  updateUserStatus(userId, 'online').catch(console.error);
+  updateUserStatus(userId, 'online').catch(err => {
+    logger.error('Failed to update user status on connection', err, { userId });
+  });
 
   // Send presence event to presence-engine
   sendPresenceEvent(userId, 'user_connected');
@@ -67,24 +75,36 @@ export const registerConnectionHandlers = (io, socket) => {
   // Broadcast updated online users list to ALL clients (including this one)
   broadcastOnlineUsers(io);
 
-  console.log(`[Connection] ✓ User ${userId} connected (socket: ${socket.id}), total online: ${onlineUsers.size}`);
+  logger.info(`User connected`, { userId, socketId: socket.id, totalOnline: onlineUsers.size });
 
   // ─── Manual user_connected event (legacy support) ──────────────────────
   socket.on('user_connected', async (data) => {
     try {
       // Already handled in auto-registration above, but keep for compatibility
-      console.log(`[Connection] Manual user_connected event from ${userId}`);
+      logger.debug(`Manual user_connected event from ${userId}`);
     } catch (error) {
-      console.error('[Connection] Error handling user_connected:', error);
+      logger.error('Error handling user_connected', error);
     }
   });
 
   // ─── Join a room (for private conversations or groups) ────────────────
   socket.on('join_room', (data) => {
+    // Check rate limit
+    if (!rateLimiters.join_room(socket)) return;
+
     try {
       const { room_id } = data;
+
+      // Validate room data
+      try {
+        validateRoomData({ room_id });
+      } catch (validationError) {
+        socket.emit('error', { message: validationError.message });
+        return;
+      }
+
       socket.join(room_id);
-      console.log(`[Room] Socket ${socket.id} (user ${socket.userId}) joined room: ${room_id}`);
+      logger.info(`Socket joined room`, { socketId: socket.id, userId: socket.userId, room_id });
 
       // Send quantum room event for group rooms
       if (room_id.startsWith('group_')) {
@@ -95,17 +115,29 @@ export const registerConnectionHandlers = (io, socket) => {
       // Acknowledge join
       socket.emit('room_joined', { room_id, success: true });
     } catch (error) {
-      console.error('[Room] Error joining room:', error);
+      logger.error('Error joining room', error, { room_id });
       socket.emit('error', { message: 'Failed to join room', error: error.message });
     }
   });
 
   // ─── Leave a room ──────────────────────────────────────────────────────
   socket.on('leave_room', (data) => {
+    // Check rate limit
+    if (!rateLimiters.leave_room(socket)) return;
+
     try {
       const { room_id } = data;
+
+      // Validate room data
+      try {
+        validateRoomData({ room_id });
+      } catch (validationError) {
+        socket.emit('error', { message: validationError.message });
+        return;
+      }
+
       socket.leave(room_id);
-      console.log(`[Room] Socket ${socket.id} (user ${socket.userId}) left room: ${room_id}`);
+      logger.info(`Socket left room`, { socketId: socket.id, userId: socket.userId, room_id });
 
       // Send quantum room event for group rooms
       if (room_id.startsWith('group_')) {
@@ -116,17 +148,27 @@ export const registerConnectionHandlers = (io, socket) => {
       // Acknowledge leave
       socket.emit('room_left', { room_id, success: true });
     } catch (error) {
-      console.error('[Room] Error leaving room:', error);
+      logger.error('Error leaving room', error, { room_id });
     }
   });
 
   // ─── Join a group (convenience method) ────────────────────────────────
-  socket.on('join_group', (data) => {
+  socket.on('join_group', (data) => {    // Check rate limit
+    if (!rateLimiters.join_group(socket)) return;
     try {
       const { group_id } = data;
+
+      // Validate group data
+      try {
+        validateGroupData({ group_id });
+      } catch (validationError) {
+        socket.emit('error', { message: validationError.message });
+        return;
+      }
+
       const roomId = `group_${group_id}`;
       socket.join(roomId);
-      console.log(`[Group] User ${socket.userId} joined group ${group_id} (room: ${roomId})`);
+      logger.info(`User joined group`, { userId: socket.userId, group_id, roomId });
 
       // Send quantum room event
       sendQuantumRoomEvent(group_id, userId, 'user_join');
@@ -139,18 +181,28 @@ export const registerConnectionHandlers = (io, socket) => {
 
       socket.emit('group_joined', { group_id, success: true });
     } catch (error) {
-      console.error('[Group] Error joining group:', error);
+      logger.error('Error joining group', error, { group_id });
       socket.emit('error', { message: 'Failed to join group', error: error.message });
     }
   });
 
   // ─── Leave a group (convenience method) ───────────────────────────────
-  socket.on('leave_group', (data) => {
+  socket.on('leave_group', (data) => {    // Check rate limit
+    if (!rateLimiters.leave_group(socket)) return;
     try {
       const { group_id } = data;
+
+      // Validate group data
+      try {
+        validateGroupData({ group_id });
+      } catch (validationError) {
+        socket.emit('error', { message: validationError.message });
+        return;
+      }
+
       const roomId = `group_${group_id}`;
       socket.leave(roomId);
-      console.log(`[Group] User ${socket.userId} left group ${group_id} (room: ${roomId})`);
+      logger.info(`User left group`, { userId: socket.userId, group_id, roomId });
 
       // Send quantum room event
       sendQuantumRoomEvent(group_id, userId, 'user_leave');
@@ -163,22 +215,17 @@ export const registerConnectionHandlers = (io, socket) => {
 
       socket.emit('group_left', { group_id, success: true });
     } catch (error) {
-      console.error('[Group] Error leaving group:', error);
+      logger.error('Error leaving group', error, { group_id });
     }
   });
 
   // ─── Typing indicator (with debouncing on server side) ──────────────────
-  const typingTimers = new Map(); // userId -> timer
-  
   socket.on('typing', (data) => {
     try {
+      if (!rateLimiters.typing(socket)) return;
+
       const { receiver_id, group_id } = data;
-      
-      // Clear existing timer for this user
-      const timerKey = socket.userId;
-      if (typingTimers.has(timerKey)) {
-        clearTimeout(typingTimers.get(timerKey));
-      }
+      validateTypingData({ receiver_id, group_id });
 
       // Send presence event (debounced - only if not sent recently)
       sendPresenceEvent(socket.userId, 'typing_start', { receiver_id, group_id });
@@ -191,6 +238,14 @@ export const registerConnectionHandlers = (io, socket) => {
           group_id,
           timestamp: new Date().toISOString(),
         });
+
+        // Set timer with group context
+        setTypingTimer(
+          socket.id,
+          socket.userId,
+          () => socket.emit('stop_typing', data),
+          `group:${group_id}`
+        );
       } else if (receiver_id) {
         // Private typing indicator
         const receiverSocketId = onlineUsers.get(receiver_id);
@@ -200,26 +255,32 @@ export const registerConnectionHandlers = (io, socket) => {
             timestamp: new Date().toISOString(),
           });
         }
-      }
 
-      // Auto-stop typing after 3 seconds
-      typingTimers.set(timerKey, setTimeout(() => {
-        socket.emit('stop_typing', data);
-      }, 3000));
+        // Set timer with receiver context
+        setTypingTimer(
+          socket.id,
+          socket.userId,
+          () => socket.emit('stop_typing', data),
+          `user:${receiver_id}`
+        );
+      }
     } catch (error) {
-      console.error('[Typing] Error handling typing event:', error);
+      logger.error('Error handling typing event', error, { user_id: socket.userId });
+      socket.emit('error', { message: error.message });
     }
   });
 
   socket.on('stop_typing', (data) => {
     try {
+      if (!rateLimiters.stop_typing(socket)) return;
+
       const { receiver_id, group_id } = data;
       
-      // Clear timer
-      const timerKey = socket.userId;
-      if (typingTimers.has(timerKey)) {
-        clearTimeout(typingTimers.get(timerKey));
-        typingTimers.delete(timerKey);
+      // Clear timers for this user
+      if (group_id) {
+        clearTypingTimer(socket.userId, `group:${group_id}`);
+      } else if (receiver_id) {
+        clearTypingTimer(socket.userId, `user:${receiver_id}`);
       }
 
       // Send presence event
@@ -242,17 +303,15 @@ export const registerConnectionHandlers = (io, socket) => {
         }
       }
     } catch (error) {
-      console.error('[Typing] Error handling stop typing event:', error);
+      logger.error('Error handling stop typing event', error, { user_id: socket.userId });
+      socket.emit('error', { message: error.message });
     }
   });
 
   // Cleanup typing timers on disconnect
   socket.on('disconnect', () => {
-    const timerKey = socket.userId;
-    if (typingTimers.has(timerKey)) {
-      clearTimeout(typingTimers.get(timerKey));
-      typingTimers.delete(timerKey);
-    }
+    // Clear all typing timers for this user
+    clearUserTypingTimers(socket.userId);
   });
 
   // ─── Request online users list ─────────────────────────────────────────
